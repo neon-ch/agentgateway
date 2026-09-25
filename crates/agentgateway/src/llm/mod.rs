@@ -1421,7 +1421,13 @@ impl AIProvider {
 						let path =
 							provider.get_path_for_model(route_type, request_model, streaming, native_gemini);
 						let path = Self::with_path_prefix(&path, path_prefix);
-						Self::set_path_and_query(uri, &path)?;
+						if native_gemini {
+							// The client's query belongs to the client's API, not Google's: Claude Code sends
+							// `/v1/messages?beta=true`, which :generateContent rejects as an unknown field.
+							uri.path_and_query = Some(PathAndQuery::try_from(path.as_str())?);
+						} else {
+							Self::set_path_and_query(uri, &path)?;
+						}
 						Ok(())
 					})?;
 					Ok(())
