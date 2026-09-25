@@ -810,8 +810,6 @@ pub mod from_completions {
 		"pattern",
 		"minimum",
 		"maximum",
-		"exclusiveMinimum",
-		"exclusiveMaximum",
 		"minItems",
 		"maxItems",
 		"minProperties",
@@ -1102,6 +1100,19 @@ pub mod from_completions {
 		}
 
 		for_each_child_schema(map, clean_schema_node);
+		// Vertex's Schema has no exclusive bounds and rejects the keywords outright; keep the bound
+		// as an inclusive one rather than dropping the constraint.
+		for (exclusive, inclusive) in [
+			("exclusiveMinimum", "minimum"),
+			("exclusiveMaximum", "maximum"),
+		] {
+			if let Some(v) = map.remove(exclusive)
+				&& v.is_number()
+				&& !map.contains_key(inclusive)
+			{
+				map.insert(inclusive.to_string(), v);
+			}
+		}
 		map.retain(|k, _| ALLOWED_SCHEMA_FIELDS.contains(&k.as_str()));
 	}
 
