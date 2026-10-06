@@ -224,7 +224,10 @@ mod requests {
 		),
 		("cache_control_responses", &[RESPONSES]),
 		("cache_control_unsupported", &[COMPLETIONS, RESPONSES]),
+		("cache_control_dropped_blocks", &[BEDROCK]),
+		("system_message_mid_conversation", &[BEDROCK]),
 		("gpt_adaptive_thinking_with_tools", &[COMPLETIONS]),
+		("reasoning_unsupported_model", &[COMPLETIONS, RESPONSES]),
 		("reasoning_replay", &[BEDROCK, COMPLETIONS, RESPONSES]),
 		(
 			"tool_history_without_tools",
@@ -942,6 +945,14 @@ mod responses {
 		("reasoning_omitted", &[COMPLETIONS_TO_MESSAGES]),
 		("gemini_zero_completion_tokens", ALL_COMPLETIONS),
 		("gemini_with_completion_tokens", ALL_COMPLETIONS),
+		(
+			"gemini_thinking",
+			&[
+				COMPLETIONS_TO_COMPLETIONS,
+				COMPLETIONS_TO_MESSAGES,
+				COMPLETIONS_TO_RESPONSES,
+			],
+		),
 		("tool_call", ALL_COMPLETIONS),
 		(
 			"truncated_tool_call",
@@ -1033,6 +1044,14 @@ mod responses {
 		(
 			"stream_tool_empty_content",
 			&[COMPLETIONS_TO_MESSAGES, COMPLETIONS_TO_RESPONSES],
+		),
+		(
+			"stream-gemini_thinking",
+			&[
+				COMPLETIONS_TO_COMPLETIONS,
+				COMPLETIONS_TO_MESSAGES,
+				COMPLETIONS_TO_RESPONSES,
+			],
 		),
 	];
 	const VERTEX_GEMINI_STREAM_RESPONSES: &[&str] = &["stream_tool"];
