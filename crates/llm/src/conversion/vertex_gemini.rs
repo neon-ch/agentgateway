@@ -1136,10 +1136,10 @@ pub mod from_completions {
 		});
 	}
 
-	/// Gemini 3.x takes a `thinkingLevel` string; Gemini 2.5 takes an integer
-	/// `thinkingBudget`. Detected by model name.
+	/// Gemini 3.x and 4.x take a `thinkingLevel` string; Gemini 2.5 takes an
+	/// integer `thinkingBudget`. Detected by model name.
 	pub(super) fn uses_thinking_levels(model: &str) -> bool {
-		model.contains("gemini-3")
+		model.contains("gemini-3") || model.contains("gemini-4")
 	}
 
 	fn thinking_config(req: &types::completions::Request, model: &str) -> Option<vg::ThinkingConfig> {

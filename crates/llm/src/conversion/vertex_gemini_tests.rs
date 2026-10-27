@@ -2860,6 +2860,43 @@ fn msg_effort_and_budget_agree_on_thinking_level() {
 }
 
 #[test]
+fn msg_thinking_enabled_uses_thinking_level_on_gemini_4_and_budget_on_gemini_25() {
+	let gemini_4 = to_gemini_msg(json!({
+		"model": "google/gemini-4-argon",
+		"max_tokens": 32000,
+		"thinking": { "type": "enabled", "budget_tokens": 4096 },
+		"messages": [{ "role": "user", "content": "hi" }]
+	}));
+	assert_eq!(
+		gemini_4["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
+		"got: {gemini_4}"
+	);
+	assert!(
+		gemini_4["generationConfig"]["thinkingConfig"]
+			.get("thinkingBudget")
+			.is_none(),
+		"got: {gemini_4}"
+	);
+
+	let gemini_25 = to_gemini_msg(json!({
+		"model": "google/gemini-2.5-pro",
+		"max_tokens": 32000,
+		"thinking": { "type": "enabled", "budget_tokens": 4096 },
+		"messages": [{ "role": "user", "content": "hi" }]
+	}));
+	assert_eq!(
+		gemini_25["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096,
+		"got: {gemini_25}"
+	);
+	assert!(
+		gemini_25["generationConfig"]["thinkingConfig"]
+			.get("thinkingLevel")
+			.is_none(),
+		"got: {gemini_25}"
+	);
+}
+
+#[test]
 fn msg_resp_signed_thought_parts_become_separate_thinking_blocks() {
 	// A thoughtSignature attests only the thought text it arrives with. Merging several signed
 	// parts into one block kept just the last signature, so echoing the block back 400s.
