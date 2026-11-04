@@ -69,6 +69,12 @@ pub fn passthrough_stream(
 							.input_tokens_details
 							.cache_write_tokens
 							.map(|tokens| tokens as u64);
+						r.response.cache_creation_12h_input_tokens = usage
+							.input_tokens_details
+							.cache_write_tokens_details
+							.as_ref()
+							.and_then(|d| d.ttl_12h_tokens)
+							.map(|t| t as u64);
 						r.response.reasoning_tokens = Some(usage.output_tokens_details.reasoning_tokens as u64);
 					}
 				});
@@ -114,6 +120,12 @@ pub fn passthrough_stream(
 							.input_tokens_details
 							.cache_write_tokens
 							.map(|tokens| tokens as u64);
+						r.response.cache_creation_12h_input_tokens = usage
+							.input_tokens_details
+							.cache_write_tokens_details
+							.as_ref()
+							.and_then(|d| d.ttl_12h_tokens)
+							.map(|t| t as u64);
 						r.response.reasoning_tokens = Some(usage.output_tokens_details.reasoning_tokens as u64);
 					}
 					if let Some(c) = completion.take() {
@@ -186,6 +198,7 @@ pub mod from_messages {
 			metadata,
 			thinking,
 			output_config,
+			cache_control: _,
 		} = typed;
 
 		// Responses has no direct stop_sequences/top_k equivalent; these are
@@ -254,6 +267,7 @@ pub mod from_messages {
 			stream: Some(stream),
 			instructions: None,
 			vendor_extensions: None,
+			reasoning: None,
 			rest: Value::Object(rest),
 		})
 	}
@@ -324,7 +338,7 @@ pub mod from_messages {
 		effort: Option<messages::ThinkingEffort>,
 	) -> Option<responses::Reasoning> {
 		let effort = effort.or_else(|| {
-			if let Some(messages::ThinkingInput::Enabled { budget_tokens }) = &thinking {
+			if let Some(messages::ThinkingInput::Enabled { budget_tokens, .. }) = &thinking {
 				Some(crate::types::anthropic_effort_for_thinking_budget(
 					*budget_tokens,
 				))
@@ -737,6 +751,13 @@ pub mod from_messages {
 			input_tokens: u.input_tokens as u64,
 			total_tokens: u.total_tokens as u64,
 			reasoning_tokens: Some(u.output_tokens_details.reasoning_tokens as u64),
+			cache_creation_12h_input_tokens: u
+				.input_tokens_details
+				.cache_write_tokens_details
+				.as_ref()
+				.and_then(|d| d.ttl_12h_tokens)
+				.map(|t| t as u64),
+			..Default::default()
 		});
 		let anthropic = translate_response_internal(resp)?;
 		Ok(Box::new(super::super::ResponseWithProviderUsage {
@@ -804,11 +825,7 @@ pub mod from_messages {
 							},
 							responses::OutputMessageContent::Refusal(refusal) => {
 								saw_refusal = true;
-								content.push(messages::ContentBlock::Text(messages::ContentTextBlock {
-									text: refusal.refusal,
-									citations: None,
-									cache_control: None,
-								}));
+								content.push(messages::ContentBlock::text(refusal.refusal));
 							},
 						}
 					}
@@ -851,16 +868,10 @@ pub mod from_messages {
 			saw_refusal,
 		)?;
 		Ok(messages::MessagesResponse {
-			id: resp.id,
-			r#type: "message".to_string(),
-			role: messages::Role::Assistant,
 			content,
-			model: resp.model,
 			stop_reason: Some(stop_reason),
-			stop_sequence: None,
 			usage,
-			input_audio_tokens: None,
-			output_audio_tokens: None,
+			..messages::MessagesResponse::start(resp.id, resp.model)
 		})
 	}
 
@@ -875,7 +886,6 @@ pub mod from_messages {
 			index: Option<usize>,
 			id: Option<String>,
 			name: Option<String>,
-			arguments: String,
 			emitted_arguments: bool,
 			open: bool,
 		}
@@ -923,24 +933,7 @@ pub mod from_messages {
 			push_event(
 				events,
 				messages::MessagesStreamEvent::MessageStart {
-					message: messages::MessagesResponse {
-						id,
-						r#type: "message".to_string(),
-						role: messages::Role::Assistant,
-						content: vec![],
-						model: model.clone(),
-						stop_reason: None,
-						stop_sequence: None,
-						usage: messages::Usage {
-							input_tokens: 0,
-							output_tokens: 0,
-							cache_creation_input_tokens: None,
-							cache_read_input_tokens: None,
-							service_tier: None,
-						},
-						input_audio_tokens: None,
-						output_audio_tokens: None,
-					},
+					message: messages::MessagesResponse::start(id, model.clone()),
 				},
 			);
 			if !model.is_empty() {
@@ -1085,11 +1078,7 @@ pub mod from_messages {
 					events,
 					messages::MessagesStreamEvent::ContentBlockStart {
 						index,
-						content_block: messages::ContentBlock::Text(messages::ContentTextBlock {
-							text: String::new(),
-							citations: None,
-							cache_control: None,
-						}),
+						content_block: messages::ContentBlock::text(String::new()),
 					},
 				);
 			}
@@ -1163,6 +1152,12 @@ pub mod from_messages {
 					.input_tokens_details
 					.cache_write_tokens
 					.map(|tokens| tokens as u64);
+				r.response.cache_creation_12h_input_tokens = usage
+					.input_tokens_details
+					.cache_write_tokens_details
+					.as_ref()
+					.and_then(|d| d.ttl_12h_tokens)
+					.map(|t| t as u64);
 				r.response.reasoning_tokens = Some(usage.output_tokens_details.reasoning_tokens as u64);
 				if let Some(service_tier) = &service_tier {
 					r.response.service_tier = Some(strng::new(service_tier));
@@ -1351,9 +1346,11 @@ pub mod from_messages {
 							Some(delta.item_id.clone()),
 							None,
 						);
-						let block = state.tool_blocks.entry(delta.output_index).or_default();
-						block.arguments.push_str(&delta.delta);
-						block.emitted_arguments = true;
+						state
+							.tool_blocks
+							.entry(delta.output_index)
+							.or_default()
+							.emitted_arguments = true;
 						record_token(&mut state, &log);
 						push_event(
 							&mut events,
@@ -1375,9 +1372,6 @@ pub mod from_messages {
 							done.name.clone(),
 						);
 						let block = state.tool_blocks.entry(done.output_index).or_default();
-						if block.arguments.is_empty() {
-							block.arguments = done.arguments.clone();
-						}
 						if !block.emitted_arguments && !done.arguments.is_empty() {
 							block.emitted_arguments = true;
 							record_token(&mut state, &log);
@@ -1448,9 +1442,6 @@ pub mod from_messages {
 								Some(call.name.clone()),
 							);
 							let block = state.tool_blocks.entry(done.output_index).or_default();
-							if block.arguments.is_empty() {
-								block.arguments = call.arguments.clone();
-							}
 							if !block.emitted_arguments && !call.arguments.is_empty() {
 								block.emitted_arguments = true;
 								push_event(
@@ -1569,6 +1560,8 @@ pub mod from_messages {
 					responses::ResponseStreamEvent::ResponseInProgress(_) => {},
 					// Text finalization is handled by ResponseContentPartDone.
 					responses::ResponseStreamEvent::ResponseOutputTextDone(_) => {},
+					responses::ResponseStreamEvent::ResponseReasoningTextDelta(_)
+					| responses::ResponseStreamEvent::ResponseReasoningTextDone(_) => {},
 				},
 			}
 			if state.failed {
@@ -1611,11 +1604,8 @@ pub mod from_messages {
 	) -> messages::Usage {
 		let Some(usage) = usage else {
 			return messages::Usage {
-				input_tokens: 0,
-				output_tokens: 0,
-				cache_creation_input_tokens: None,
-				cache_read_input_tokens: None,
 				service_tier,
+				..Default::default()
 			};
 		};
 		let cache_creation_input_tokens = usage
@@ -1634,6 +1624,7 @@ pub mod from_messages {
 			cache_creation_input_tokens,
 			cache_read_input_tokens,
 			service_tier,
+			..Default::default()
 		}
 	}
 
@@ -1646,6 +1637,7 @@ pub mod from_messages {
 			output_tokens: Some(usage.output_tokens),
 			cache_creation_input_tokens: usage.cache_creation_input_tokens,
 			cache_read_input_tokens: usage.cache_read_input_tokens,
+			..Default::default()
 		}
 	}
 

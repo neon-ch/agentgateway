@@ -62,15 +62,12 @@ type Condition struct {
 
 // SetConditions sets the existingConditions with the new conditions
 func SetConditions(generation int64, existingConditions []metav1.Condition, conditions map[string]*Condition) []metav1.Condition {
+	// Copy once up front and update in place; the caller's slice is never mutated.
+	out := make([]metav1.Condition, len(existingConditions), len(existingConditions)+len(conditions))
+	copy(out, existingConditions)
 	// Sort keys for deterministic ordering
 	for _, k := range slices.Sort(maps.Keys(conditions)) {
 		cond := conditions[k]
-		setter := kstatus.UpdateConditionIfChanged
-		if cond.SetOnce != "" {
-			setter = func(conditions []metav1.Condition, condition metav1.Condition) []metav1.Condition {
-				return kstatus.CreateCondition(conditions, condition, cond.SetOnce)
-			}
-		}
 		// A condition can be "negative polarity" (ex: ListenerInvalid) or "positive polarity" (ex:
 		// ListenerValid), so in order to determine the status we should set each `condition` defines its
 		// default positive status. When there is an error, we will invert that. Example: If we have
@@ -78,42 +75,58 @@ func SetConditions(generation int64, existingConditions []metav1.Condition, cond
 		// will be inverted to StatusTrue to indicate listeners are invalid. See
 		// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 		// for more information
+		c := metav1.Condition{
+			Type:               k,
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}
 		if cond.Error != nil {
-			existingConditions = setter(existingConditions, metav1.Condition{
-				Type:               k,
-				Status:             kstatus.InvertStatus(cond.Status),
-				ObservedGeneration: generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             cond.Error.Reason,
-				Message:            cond.Error.Message,
-			})
+			c.Status = kstatus.InvertStatus(cond.Status)
+			c.Reason = cond.Error.Reason
+			c.Message = cond.Error.Message
 		} else {
-			status := cond.Status
-			if status == "" {
-				status = kstatus.StatusTrue
+			c.Status = cond.Status
+			if c.Status == "" {
+				c.Status = kstatus.StatusTrue
 			}
-			existingConditions = setter(existingConditions, metav1.Condition{
-				Type:               k,
-				Status:             status,
-				ObservedGeneration: generation,
-				LastTransitionTime: metav1.Now(),
-				Reason:             cond.Reason,
-				Message:            cond.Message,
-			})
+			c.Reason = cond.Reason
+			c.Message = cond.Message
+		}
+
+		idx := slices.IndexFunc(out, func(e metav1.Condition) bool {
+			return e.Type == k
+		})
+		switch {
+		case idx == -1:
+			out = append(out, c)
+		case cond.SetOnce != "":
+			// Only overwrite a condition still holding its default (SetOnce) reason.
+			if out[idx].Reason == cond.SetOnce {
+				out[idx] = c
+			}
+		default:
+			existing := out[idx]
+			if existing.Status == c.Status {
+				if existing.Message == c.Message && existing.ObservedGeneration == c.ObservedGeneration {
+					continue
+				}
+				// retain LastTransitionTime if status is not changed
+				c.LastTransitionTime = existing.LastTransitionTime
+			}
+			out[idx] = c
 		}
 	}
-	return existingConditions
+	return out
 }
 
 func reportListenerCondition(index int, l gwv1.Listener, obj controllers.Object,
 	statusListeners []gwv1.ListenerStatus, conditions map[string]*Condition,
-	enableAgentgatewayModels bool,
 ) []gwv1.ListenerStatus {
 	for index >= len(statusListeners) {
 		statusListeners = append(statusListeners, gwv1.ListenerStatus{})
 	}
 	cond := statusListeners[index].Conditions
-	supported, valid := GenerateSupportedKinds(l, enableAgentgatewayModels)
+	supported, valid := GenerateSupportedKinds(l)
 	if !valid {
 		conditions[string(gwv1.ListenerConditionResolvedRefs)] = &Condition{
 			Reason:  string(gwv1.ListenerReasonInvalidRouteKinds),
@@ -130,7 +143,7 @@ func reportListenerCondition(index int, l gwv1.Listener, obj controllers.Object,
 }
 
 // GenerateSupportedKinds returns the supported kinds for the listener.
-func GenerateSupportedKinds(l gwv1.Listener, enableAgentgatewayModels bool) ([]gwv1.RouteGroupKind, bool) {
+func GenerateSupportedKinds(l gwv1.Listener) ([]gwv1.RouteGroupKind, bool) {
 	supported := []gwv1.RouteGroupKind{}
 	switch l.Protocol {
 	case gwv1.HTTPProtocolType, gwv1.HTTPSProtocolType:
@@ -142,7 +155,7 @@ func GenerateSupportedKinds(l gwv1.Listener, enableAgentgatewayModels bool) ([]g
 		// AgentgatewayModel is opt-in. Listing it in allowedRoutes enables the
 		// listener's built-in LLM routes; it is not enabled by the default route
 		// kinds.
-		if enableAgentgatewayModels && l.AllowedRoutes != nil {
+		if l.AllowedRoutes != nil {
 			modelKind := toRouteKind(wellknown.AgentgatewayModelGVK)
 			for _, kind := range l.AllowedRoutes.Kinds {
 				if routeGroupKindEqual(modelKind, kind) {

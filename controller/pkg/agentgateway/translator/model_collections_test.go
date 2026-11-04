@@ -130,7 +130,7 @@ func TestModelServingRuleMatchesRoot(t *testing.T) {
 func TestModelReferenceIgnoresListenerHostname(t *testing.T) {
 	parent := &ParentInfo{
 		AllowedKinds: []gwv1.RouteGroupKind{toRouteKind(wellknown.AgentgatewayModelGVK)},
-		Hostnames:    []string{"other-namespace/models.example.com"},
+		Hostnames:    []string{"default/models.example.com"},
 	}
 
 	if err := ReferenceAllowed(
@@ -142,43 +142,6 @@ func TestModelReferenceIgnoresListenerHostname(t *testing.T) {
 		"default",
 	); err != nil {
 		t.Fatalf("model attachment should not depend on listener hostname: %v", err)
-	}
-}
-
-func TestAgentgatewayModelSupportedKindsFeatureGate(t *testing.T) {
-	modelKind := toRouteKind(wellknown.AgentgatewayModelGVK)
-	listener := gwv1.Listener{
-		Protocol: gwv1.HTTPProtocolType,
-		AllowedRoutes: &gwv1.AllowedRoutes{
-			Kinds: []gwv1.RouteGroupKind{modelKind},
-		},
-	}
-
-	for _, tt := range []struct {
-		name      string
-		enabled   bool
-		want      bool
-		wantValid bool
-	}{
-		{name: "disabled", enabled: false, want: false, wantValid: false},
-		{name: "enabled", enabled: true, want: true, wantValid: true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			supported, valid := GenerateSupportedKinds(listener, tt.enabled)
-			if valid != tt.wantValid {
-				t.Errorf("listener valid = %t, want %t", valid, tt.wantValid)
-			}
-			found := false
-			for _, kind := range supported {
-				found = routeGroupKindEqual(kind, modelKind)
-				if found {
-					break
-				}
-			}
-			if found != tt.want {
-				t.Errorf("AgentgatewayModel supported = %t, want %t", found, tt.want)
-			}
-		})
 	}
 }
 

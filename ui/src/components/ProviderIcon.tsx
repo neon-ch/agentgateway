@@ -14,11 +14,14 @@ import groqIcon from '@/assets/providers/groq.svg';
 import huggingfaceIcon from '@/assets/providers/huggingface.svg';
 import metaIcon from '@/assets/providers/meta.svg';
 import mistralIcon from '@/assets/providers/mistral.svg';
+import nebiusIcon from '@/assets/providers/nebius.svg';
 import ollamaIcon from '@/assets/providers/ollama.svg';
 import openAiIcon from '@/assets/providers/openai.svg';
 import openrouterIcon from '@/assets/providers/openrouter.svg';
 import perplexityIcon from '@/assets/providers/perplexity.svg';
 import togetheraiIcon from '@/assets/providers/togetherai.svg';
+import typesafeIcon from '@/assets/providers/typesafe.svg';
+import typesafeDarkIcon from '@/assets/providers/typesafe-dark.svg';
 import vertexIcon from '@/assets/providers/vertex.svg';
 import xaiIcon from '@/assets/providers/xai.svg';
 import { providerDisplayName } from '@/config';
@@ -33,6 +36,7 @@ const providerIcons: Record<string, string> = {
 	bedrock: bedrockIcon,
 	azure: azureIcon,
 	copilot: copilotIcon,
+	typesafe: typesafeIcon,
 	cohere: cohereIcon,
 	ollama: ollamaIcon,
 	baseten: basetenIcon,
@@ -48,7 +52,12 @@ const providerIcons: Record<string, string> = {
 	fireworks: fireworksIcon,
 	meta: metaIcon,
 	perplexity: perplexityIcon,
+	nebius: nebiusIcon,
 	custom: agwIcon
+};
+
+const darkProviderIcons: Record<string, string> = {
+	typesafe: typesafeDarkIcon
 };
 
 const monochromeProviders = new Set<string>([
@@ -57,6 +66,7 @@ const monochromeProviders = new Set<string>([
 	'anthropic',
 	'baseten',
 	'copilot',
+	'nebius',
 	'ollama',
 	'openrouter',
 	'togetherai',
@@ -70,6 +80,19 @@ export function ProviderIcon(props: { provider: ProviderName | string }) {
 			<span className="provider-icon provider-icon-fallback">
 				{providerInitials(props.provider)}
 			</span>
+		);
+	const darkIcon = darkProviderIcons[props.provider];
+	if (darkIcon)
+		return (
+			<>
+				<img className="provider-icon provider-icon-light" src={icon} alt="" aria-hidden="true" />
+				<img
+					className="provider-icon provider-icon-dark"
+					src={darkIcon}
+					alt=""
+					aria-hidden="true"
+				/>
+			</>
 		);
 	return (
 		<img

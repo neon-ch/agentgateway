@@ -18,7 +18,7 @@ cd "$REPO_ROOT"
 
 TIMINGS_FILE="${REPO_ROOT}/controller/_test/ci-step-timings.log"
 CLUSTER_NAME="${CLUSTER_NAME:-kind}"
-KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.36.1}"
+KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.37.0}"
 KIND_REGISTRY_NAME="${KIND_REGISTRY_NAME:-kind-registry}"
 KIND_REGISTRY_PORT="${KIND_REGISTRY_PORT:-5000}"
 LOCAL_REGISTRY="localhost:${KIND_REGISTRY_PORT}"
@@ -264,7 +264,6 @@ function step_deploy_helm() {
 	  --set-string image.tag="${TAG}"\
 	   --set controller.image.repository=agentgateway-controller \
 	   --set inferenceExtension.enabled=true \
-	   --set agentgatewayModels.enabled=true \
 	   "$@"
 }
 function step_setup_gateway_api() {
