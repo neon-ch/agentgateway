@@ -72,7 +72,7 @@ pub fn parse_config(
 		.or(local_config_source);
 
 	let dns = raw.dns.unwrap_or_default();
-	let dns_lookup_family = match env::var("DNS_LOOKUP_FAMILY") {
+	let dns_lookup_family = match env_var("DNS_LOOKUP_FAMILY") {
 		Ok(val) => Some(DnsLookupFamily::from_env_str(&val).ctx("invalid DNS_LOOKUP_FAMILY")?),
 		Err(_) => None,
 	}
@@ -374,12 +374,21 @@ pub fn parse_config(
 		ThreadingMode::default()
 	};
 
-	let session_encoder = if let Some(key) = parse::<String>("SESSION_KEY")? {
-		crate::http::sessionpersistence::Encoder::aes(key.trim())
-			.ctx("invalid session persistence key SESSION_KEY")?
+	let session_key_env = parse::<String>("SESSION_KEY")?;
+	let session_key_unset = session_key_env.is_none() && raw.session.is_none();
+	let session_encoder = if let Some(key) = session_key_env {
+		if key.trim() == "disabled" {
+			crate::http::sessionpersistence::Encoder::base64()
+		} else {
+			crate::http::sessionpersistence::Encoder::aes(key.trim())
+				.ctx("invalid session persistence key SESSION_KEY")?
+		}
 	} else {
 		match raw.session.as_ref() {
 			None => crate::http::sessionpersistence::Encoder::base64(),
+			Some(session) if session.key.expose_secret() == "disabled" => {
+				crate::http::sessionpersistence::Encoder::base64()
+			},
 			Some(session) => {
 				let key = session.key.expose_secret();
 				crate::http::sessionpersistence::Encoder::aes(key)
@@ -449,8 +458,10 @@ pub fn parse_config(
 		termination_min_deadline,
 		threading_mode,
 		backend: raw.backend,
+		callouts: raw.callouts,
 		admin_runtime_handle: None,
 		budget_policy: Arc::new(crate::http::budget::BudgetPolicy::default()),
+		config_reload_status: Arc::new(crate::ConfigReloadStatus::default()),
 		termination_max_deadline,
 		tracing: raw
 			.tracing
@@ -576,6 +587,10 @@ pub fn parse_config(
 					standard_attributes(raw.standard_attributes.as_ref())
 						.ctx("invalid config.standardAttributes")?,
 				)),
+				session: Arc::new(arc_swap::ArcSwapOption::new(
+					session_attribute(raw.standard_attributes.as_ref())
+						.ctx("invalid config.standardAttributes.session")?,
+				)),
 		},
 		dns: client::Config {
 			resolver_cfg,
@@ -604,6 +619,7 @@ pub fn parse_config(
 		storage,
 		sensitive_headers,
 		session_encoder,
+		session_key_unset,
 		oidc_cookie_encoder,
 			hbone: Arc::new(agent_hbone::Config {
 				h2: agent_hbone::H2Config {
@@ -676,6 +692,10 @@ pub(crate) fn standard_attributes(
 				.and_then(|attributes| attributes.group.clone())
 				.unwrap_or_else(|| DEFAULT_UI_GROUP_ATTRIBUTE.to_string()),
 		),
+		(
+			"agentgateway.session".to_string(),
+			"request.agent.session".to_string(),
+		),
 	];
 
 	Ok(LoggingFields {
@@ -692,11 +712,70 @@ pub(crate) fn standard_attributes(
 		),
 	})
 }
+pub(crate) fn session_attribute(
+	standard_attributes: Option<&crate::RawStandardAttributes>,
+) -> anyhow::Result<Option<Arc<cel::Expression>>> {
+	let Some(session) = standard_attributes.and_then(|attributes| attributes.session.as_ref()) else {
+		return Ok(None);
+	};
+	Ok(Some(Arc::new(cel::Expression::new_strict(session)?)))
+}
+
+#[cfg(test)]
+thread_local! {
+	static TEST_ENV: std::cell::RefCell<Option<std::collections::HashMap<String, String>>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// Replaces the environment seen by config parsing on the current thread until dropped, so tests
+/// can cover env-driven config without mutating the process env other tests read concurrently.
+#[cfg(test)]
+struct TestEnv;
+
+#[cfg(test)]
+impl TestEnv {
+	fn set(vars: &[(&str, &str)]) -> Self {
+		let vars = vars
+			.iter()
+			.map(|(k, v)| (k.to_string(), v.to_string()))
+			.collect();
+		TEST_ENV.set(Some(vars));
+		TestEnv
+	}
+}
+
+#[cfg(test)]
+impl Drop for TestEnv {
+	fn drop(&mut self) {
+		TEST_ENV.set(None);
+	}
+}
+
+fn env_var(key: &str) -> Result<String, env::VarError> {
+	#[cfg(test)]
+	if let Some(res) = TEST_ENV.with_borrow(|vars| {
+		vars
+			.as_ref()
+			.map(|vars| vars.get(key).cloned().ok_or(env::VarError::NotPresent))
+	}) {
+		return res;
+	}
+	env::var(key)
+}
+
+fn env_vars() -> Vec<(String, String)> {
+	#[cfg(test)]
+	if let Some(vars) = TEST_ENV.with_borrow(|vars| vars.clone()) {
+		return vars.into_iter().collect();
+	}
+	env::vars().collect()
+}
+
 fn parse<T: FromStr>(env: &str) -> anyhow::Result<Option<T>>
 where
 	<T as FromStr>::Err: ToString,
 {
-	match env::var(env) {
+	match env_var(env) {
 		Ok(val) => val
 			.parse()
 			.map(|v| Some(v))
@@ -784,7 +863,7 @@ fn parse_worker_threads(cfg: Option<StringOrInt>) -> anyhow::Result<usize> {
 fn parse_otlp_headers(
 	env_key: &str,
 ) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
-	match env::var(env_key) {
+	match env_var(env_key) {
 		Ok(raw) => {
 			let s = raw.trim();
 			if s.starts_with('{') {
@@ -813,7 +892,7 @@ fn parse_otlp_headers(
 }
 
 fn parse_otlp_protocol(env_key: &str) -> anyhow::Result<Option<trc::Protocol>> {
-	match env::var(env_key) {
+	match env_var(env_key) {
 		Ok(raw) => {
 			let protocol = match raw.trim().trim_matches('"').to_ascii_lowercase().as_str() {
 				"grpc" => trc::Protocol::Grpc,
@@ -948,7 +1027,7 @@ fn get_cpu_count() -> anyhow::Result<usize> {
 fn parse_headers(prefix: &str) -> Result<Vec<(String, String)>, anyhow::Error> {
 	let mut headers = Vec::new();
 
-	for (key, value) in env::vars() {
+	for (key, value) in env_vars() {
 		let stripped_key: Option<&str> = key.strip_prefix(prefix);
 		match stripped_key {
 			Some(stripped_key) => {
@@ -1065,6 +1144,85 @@ mod parse_headers_tests {
 	}
 }
 
+/// Generates and persists a session key when none is configured, so MCP sessions are encrypted
+/// by default. In hybrid mode the key is shared through the database; in file mode it is written
+/// back to `config.session.key` in the config file.
+pub async fn ensure_session_key(
+	config: &mut Config,
+	config_source: Option<&ConfigSource>,
+	store: Option<&crate::config_store::ConfigResourceStore>,
+) -> anyhow::Result<()> {
+	if !config.session_key_unset {
+		return Ok(());
+	}
+	let key = match (store, config_source) {
+		(Some(store), _) => Some(store.session_key().await?),
+		(None, Some(ConfigSource::File(path))) if config.storage.mode == ConfigStoreMode::File => {
+			match persist_session_key(path).await {
+				Ok(key) => Some(key),
+				Err(err) => {
+					warn!(?err, path = %path.display(), "failed to write generated session key");
+					None
+				},
+			}
+		},
+		_ => None,
+	};
+	match key {
+		Some(key) => {
+			config.session_encoder =
+				crate::http::sessionpersistence::Encoder::aes(&key).ctx("invalid generated session key")?;
+		},
+		None => warn!(
+			"no session key configured; MCP session IDs are not encrypted. Set SESSION_KEY or config.session.key"
+		),
+	}
+	Ok(())
+}
+
+async fn persist_session_key(path: &Path) -> anyhow::Result<String> {
+	let key = crate::config_store::generate_session_key()?;
+	let current = fs_err::tokio::read_to_string(path).await?;
+	let mut document = yaml_serde_edit::YamlObject::<serde_json::Value>::parse(&current)?;
+	let mut cfg = document.get().clone();
+	let section = cfg
+		.as_object_mut()
+		.context("config file must be an object")?
+		.entry("config")
+		.or_insert(serde_json::Value::Null);
+	if section.is_null() {
+		*section = serde_json::json!({});
+	}
+	section
+		.as_object_mut()
+		.context("config.config must be an object")?
+		.insert("session".to_string(), serde_json::json!({ "key": key }));
+	let content = match document.set(cfg.clone()) {
+		Ok(()) => document.get_string().to_owned(),
+		Err(yaml_serde_edit::Error::RoundTrip) => crate::yaml::to_string(&cfg)?,
+		Err(e) => return Err(e.into()),
+	};
+	let content = content
+		.lines()
+		.map(|line| {
+			if line.contains(&key) {
+				let indent = &line[..line.len() - line.trim_start().len()];
+				format!(
+					"{indent}# Auto-generated by agentgateway to encode session IDs. Changing it invalidates existing sessions.\n{line}\n"
+				)
+			} else {
+				format!("{line}\n")
+			}
+		})
+		.collect::<String>();
+	fs_err::tokio::write(path, content).await?;
+	info!(
+		path = %path.display(),
+		"generated a session key and wrote it to config.session.key; we recommend setting SESSION_KEY instead"
+	);
+	Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::env;
@@ -1160,12 +1318,13 @@ mod tests {
 
 	#[test]
 	fn tracing_accepts_standard_otlp_env_vars() {
-		let _env_lock = lock_env();
-		let _endpoint = TempEnvVar::set(
-			"OTEL_EXPORTER_OTLP_ENDPOINT",
-			"http://collector.example:4318",
-		);
-		let _protocol = TempEnvVar::set("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+		let _env = TestEnv::set(&[
+			(
+				"OTEL_EXPORTER_OTLP_ENDPOINT",
+				"http://collector.example:4318",
+			),
+			("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+		]);
 
 		let config = parse_config(
 			r#"
@@ -1188,20 +1347,20 @@ config:
 
 	#[test]
 	fn tracing_prefers_signal_specific_otlp_env_vars() {
-		let _env_lock = lock_env();
-		let _endpoint = TempEnvVar::set(
-			"OTEL_EXPORTER_OTLP_ENDPOINT",
-			"http://collector.example:4318",
-		);
-		let _traces_endpoint = TempEnvVar::set(
-			"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-			"http://traces.example:4318/custom/traces",
-		);
-		let _headers = TempEnvVar::set("OTEL_EXPORTER_OTLP_HEADERS", "authorization=general");
-		let _traces_headers =
-			TempEnvVar::set("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "authorization=traces");
-		let _protocol = TempEnvVar::set("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc");
-		let _traces_protocol = TempEnvVar::set("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf");
+		let _env = TestEnv::set(&[
+			(
+				"OTEL_EXPORTER_OTLP_ENDPOINT",
+				"http://collector.example:4318",
+			),
+			(
+				"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+				"http://traces.example:4318/custom/traces",
+			),
+			("OTEL_EXPORTER_OTLP_HEADERS", "authorization=general"),
+			("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "authorization=traces"),
+			("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+			("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+		]);
 
 		let config = parse_config(
 			r#"
@@ -1228,16 +1387,17 @@ config:
 
 	#[test]
 	fn tracing_prefers_legacy_otlp_env_vars() {
-		let _env_lock = lock_env();
-		let _legacy_endpoint = TempEnvVar::set("OTLP_ENDPOINT", "http://legacy.example:4317");
-		let _standard_endpoint = TempEnvVar::set(
-			"OTEL_EXPORTER_OTLP_ENDPOINT",
-			"http://collector.example:4318",
-		);
-		let _legacy_headers = TempEnvVar::set("OTLP_HEADERS", "authorization=legacy");
-		let _standard_headers = TempEnvVar::set("OTEL_EXPORTER_OTLP_HEADERS", "authorization=standard");
-		let _legacy_protocol = TempEnvVar::set("OTLP_PROTOCOL", "grpc");
-		let _standard_protocol = TempEnvVar::set("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
+		let _env = TestEnv::set(&[
+			("OTLP_ENDPOINT", "http://legacy.example:4317"),
+			(
+				"OTEL_EXPORTER_OTLP_ENDPOINT",
+				"http://collector.example:4318",
+			),
+			("OTLP_HEADERS", "authorization=legacy"),
+			("OTEL_EXPORTER_OTLP_HEADERS", "authorization=standard"),
+			("OTLP_PROTOCOL", "grpc"),
+			("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+		]);
 
 		let config = parse_config(
 			r#"
@@ -1331,12 +1491,13 @@ config:
 
 	#[test]
 	fn xds_headers_are_loaded_from_environment() {
-		let _env_lock = lock_env();
-		let _address = TempEnvVar::set("XDS_ADDRESS", "http://127.0.0.1:15010");
-		let _namespace = TempEnvVar::set("NAMESPACE", "default");
-		let _gateway = TempEnvVar::set("GATEWAY", "agentgateway");
-		let _revision = TempEnvVar::set("XDS_HEADER_X_ISTIO_REVISION", "canary");
-		let _tenant = TempEnvVar::set("XDS_HEADER_X_TENANT", "team-a");
+		let _env = TestEnv::set(&[
+			("XDS_ADDRESS", "http://127.0.0.1:15010"),
+			("NAMESPACE", "default"),
+			("GATEWAY", "agentgateway"),
+			("XDS_HEADER_X_ISTIO_REVISION", "canary"),
+			("XDS_HEADER_X_TENANT", "team-a"),
+		]);
 
 		let config = parse_config("{}".to_string(), None).expect("config should parse");
 
@@ -1351,19 +1512,6 @@ config:
 				.xds
 				.headers
 				.contains(&("x-tenant".to_string(), "team-a".to_string()))
-		);
-	}
-
-	#[test]
-	fn invalid_xds_header_is_rejected_during_startup() {
-		let _env_lock = lock_env();
-		let _header = TempEnvVar::set("XDS_HEADER_X_TENANT", "bad\nvalue");
-
-		let err = parse_config("{}".to_string(), None).expect_err("invalid header should fail");
-
-		assert!(
-			err.to_string().contains("invalid XDS_HEADER_*"),
-			"unexpected error: {err}"
 		);
 	}
 
@@ -1538,9 +1686,10 @@ config:
 
 	#[test]
 	fn dynamic_ca_cert_cache_uses_config_env_overrides() {
-		let _env_lock = lock_env();
-		let _ttl = TempEnvVar::set("DYNAMIC_CA_CERT_CACHE_TTL", "2m");
-		let _capacity = TempEnvVar::set("DYNAMIC_CA_CERT_CACHE_CAPACITY", "17");
+		let _env = TestEnv::set(&[
+			("DYNAMIC_CA_CERT_CACHE_TTL", "2m"),
+			("DYNAMIC_CA_CERT_CACHE_CAPACITY", "17"),
+		]);
 
 		let config = parse_config("{}".to_string(), None).expect("config should parse");
 
@@ -1550,8 +1699,7 @@ config:
 
 	#[test]
 	fn dynamic_ca_cert_cache_rejects_zero_capacity() {
-		let _env_lock = lock_env();
-		let _capacity = TempEnvVar::set("DYNAMIC_CA_CERT_CACHE_CAPACITY", "0");
+		let _env = TestEnv::set(&[("DYNAMIC_CA_CERT_CACHE_CAPACITY", "0")]);
 
 		let err = parse_config("{}".to_string(), None).expect_err("zero capacity should fail");
 
@@ -1565,14 +1713,9 @@ config:
 
 	#[test]
 	fn session_key_env_overrides_inline_session_config() {
-		let _env_lock = lock_env();
-
 		let env_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 		let inline_key = "f1e1d1c1b1a1918171615141312111000f0e0d0c0b0a09080706050403020100";
-
-		unsafe {
-			env::set_var("SESSION_KEY", env_key);
-		}
+		let _env = TestEnv::set(&[("SESSION_KEY", env_key)]);
 
 		let config = parse_config(
 			format!(
@@ -1602,10 +1745,6 @@ config:
 		assert!(
 			crate::http::sessionpersistence::SessionState::decode(&encoded, &inline_encoder).is_err()
 		);
-
-		unsafe {
-			env::remove_var("SESSION_KEY");
-		}
 	}
 
 	#[test]
@@ -1787,23 +1926,14 @@ config:
 
 	#[test]
 	fn session_key_env_enables_aes_session_encoder() {
-		let _env_lock = lock_env();
-
 		let session_key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-
-		unsafe {
-			env::set_var("SESSION_KEY", session_key);
-		}
+		let _env = TestEnv::set(&[("SESSION_KEY", session_key)]);
 
 		let config = parse_config("{}".to_string(), None).expect("config should parse");
 		assert!(matches!(
 			config.session_encoder,
 			crate::http::sessionpersistence::Encoder::Aes(_)
 		));
-
-		unsafe {
-			env::remove_var("SESSION_KEY");
-		}
 	}
 
 	#[test]

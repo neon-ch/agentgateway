@@ -759,6 +759,17 @@ type FrontendConnect struct {
 	Mode FrontendConnectMode `json:"mode"`
 }
 
+// +k8s:enum
+type FrontendHTTPNormalize string
+
+const (
+	FrontendHTTPNormalizeMergeSlash         FrontendHTTPNormalize = "MergeSlash"
+	FrontendHTTPNormalizeDotSegment         FrontendHTTPNormalize = "DotSegment"
+	FrontendHTTPNormalizeDecodeUnreserved   FrontendHTTPNormalize = "DecodeUnreserved"
+	FrontendHTTPNormalizeRejectEscapedSlash FrontendHTTPNormalize = "RejectEscapedSlash"
+	FrontendHTTPNormalizeUnescapeSlash      FrontendHTTPNormalize = "UnescapeSlash"
+)
+
 // +kubebuilder:validation:AtLeastOneFieldSet
 type FrontendHTTP struct {
 	// Maximum HTTP body size that will be buffered
@@ -831,6 +842,29 @@ type FrontendHTTP struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxConcurrentRequests *int32 `json:"maxConcurrentRequests,omitempty"`
+
+	// `normalize` defines path normalization rules applied before route matching.
+	// The normalized path is used for routing, policies and the upstream request;
+	// access logs keep the original path. Rules are applied in a fixed order
+	// regardless of how they are listed: percent-decoding, then `MergeSlash`,
+	// then `DotSegment`.
+	//
+	// Malformed percent-encoding and `%00` are rejected with 400 whenever any rule
+	// other than `MergeSlash` is set.
+	//
+	// `MergeSlash` collapses repeated slashes into one, treating `\` as `/`.
+	// `DotSegment` resolves `.` and `..` segments, treating `%2E` as `.`, `\` as `/`,
+	// and ignoring parameters on dot segments (`..;x`).
+	// `DecodeUnreserved` decodes percent-encoded unreserved characters (`A-Z a-z 0-9 - . _ ~`).
+	// `RejectEscapedSlash` rejects requests whose path contains `%2F` or `%5C` with 400.
+	// `UnescapeSlash` decodes `%2F` and `%5C` into `/`.
+	//
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:XValidation:rule="!(self.exists(x, x == 'RejectEscapedSlash') && self.exists(x, x == 'UnescapeSlash'))",message="RejectEscapedSlash and UnescapeSlash are mutually exclusive"
+	// +optional
+	Normalize []FrontendHTTPNormalize `json:"normalize,omitempty"`
 }
 
 // +kubebuilder:validation:AtLeastOneFieldSet
@@ -1625,10 +1659,12 @@ type BackendAuth struct {
 	GCP *GcpAuth `json:"gcp,omitempty"`
 
 	// OAuth 2.0 token exchange (RFC 8693) / jwt-bearer (RFC 7523) authentication.
+	// If this configuration is invalid, requests using it are rejected.
 	// +optional
 	OAuthTokenExchange *OAuthTokenExchange `json:"oauthTokenExchange,omitempty"`
 
 	// Cross App Access (Identity Assertion / ID-JAG) authentication.
+	// If this configuration is invalid, requests using it are rejected.
 	// +optional
 	CrossAppAccess *CrossAppAccessAuth `json:"crossAppAccess,omitempty"`
 
@@ -1889,7 +1925,9 @@ type OAuthTokenExchange struct {
 	RequestedTokenType *OAuthTokenType `json:"requestedTokenType,omitempty"`
 
 	// Extra form params; values are CEL expressions over the incoming request.
+	// Parameters set by the gateway itself (for example `scope`, `audience`, or `client_id`) may not be overridden.
 	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(k, !(k.lowerAscii() in ['grant_type', 'subject_token', 'subject_token_type', 'actor_token', 'actor_token_type', 'assertion', 'audience', 'resource', 'scope', 'requested_token_type', 'client_id', 'client_secret', 'client_assertion', 'client_assertion_type']))",message="additionalParams may not override a reserved OAuth parameter"
 	// +optional
 	AdditionalParams map[string]CELExpression `json:"additionalParams,omitempty"`
 
@@ -2352,10 +2390,11 @@ type BackendAI struct {
 	// +optional
 	ModelAliases map[string]string `json:"modelAliases,omitempty"`
 
-	// Automatic prompt caching for supported
-	// providers, currently AWS Bedrock.
+	// Automatic prompt caching for supported providers: Anthropic, Anthropic
+	// models on Vertex AI, and AWS Bedrock (Claude 3+ and Nova models).
 	// Reduces API costs by caching static content like system prompts and tool definitions.
-	// Only applicable for Bedrock Claude 3+ and Nova models.
+	// Cache marks sent by the client take precedence: if a request already has any,
+	// the policy adds none.
 	// +optional
 	PromptCaching *PromptCachingConfig `json:"promptCaching,omitempty"`
 
@@ -2413,6 +2452,12 @@ const (
 	// RouteTypeGeminiCountTokens processes Gemini `models/{model}:countTokens`
 	// format requests.
 	RouteTypeGeminiCountTokens RouteType = "GeminiCountTokens"
+
+	// RouteTypeDecisions processes OpenAI `/v1/decisions` format requests.
+	RouteTypeDecisions RouteType = "Decisions"
+
+	// RouteTypeSystemOne processes TypeSafe `/v1/systemone` format requests.
+	RouteTypeSystemOne RouteType = "SystemOne"
 )
 
 // +kubebuilder:validation:AtLeastOneFieldSet
@@ -2436,7 +2481,7 @@ type BackendMCP struct {
 	// +optional
 	Authentication *MCPAuthentication `json:"authentication,omitempty"`
 
-	// `guardrails` routes selected JSON-RPC methods through a remote policy server.
+	// Remote and in-process CEL policy processors for MCP requests and responses.
 	// +optional
 	Guardrails *MCPGuardrails `json:"guardrails,omitempty"`
 }
@@ -2465,11 +2510,15 @@ type MCPGuardrails struct {
 }
 
 // MCPGuardrailsProcessor selects a single policy processor. Exactly one variant must be set.
-// +kubebuilder:validation:ExactlyOneOf=remote
+// +kubebuilder:validation:ExactlyOneOf=remote;expression
 type MCPGuardrailsProcessor struct {
 	// `remote` configures a gRPC policy server.
 	// +optional
 	Remote *MCPGuardrailsRemote `json:"remote,omitempty"`
+
+	// In-process guardrail driven by CEL expressions.
+	// +optional
+	Expression *MCPGuardrailsExpression `json:"expression,omitempty"`
 
 	// `methods` is the allowlist of JSON-RPC methods (e.g. `tools/call`,
 	// `tools/list`) routed through this processor, keyed by method name with the
@@ -2481,6 +2530,25 @@ type MCPGuardrailsProcessor struct {
 	// +kubebuilder:validation:MaxProperties=64
 	// +kubebuilder:validation:XValidation:rule="self.all(k, !k.contains('*') || (k.indexOf('*') == k.lastIndexOf('*') && (k.indexOf('*') == 0 || k.indexOf('*') == size(k) - 1)))",message="method wildcards must be '*', a prefix like 'tools/*', or a suffix like '*/list'"
 	Methods map[string]MCPMethodPhase `json:"methods"`
+}
+
+// In-process guardrail driven by CEL expressions.
+// +kubebuilder:validation:ExactlyOneOf=reject;transform
+type MCPGuardrailsExpression struct {
+	// Condition gating the action; absent means always.
+	// +optional
+	Condition *CELExpression `json:"condition,omitempty"`
+
+	// Reject with this message.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=4096
+	Reject *string `json:"reject,omitempty"`
+
+	// Returns a replacement body (`mcp.params` on requests or `mcp.result` on responses).
+	// Use `merge` to preserve fields you do not wish to mutate; `null` leaves the body unchanged.
+	// +optional
+	Transform *CELExpression `json:"transform,omitempty"`
 }
 
 // +kubebuilder:validation:ExactlyOneOf=backendRef;url
