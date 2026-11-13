@@ -2329,6 +2329,7 @@ pub mod to_messages {
 				cache_read_input_tokens: None,
 				cache_creation: None,
 				service_tier: None,
+				speed: None,
 				iterations: Vec::new(),
 			};
 		};
@@ -2346,6 +2347,7 @@ pub mod to_messages {
 			cache_read_input_tokens: (cached > 0).then_some(cached),
 			cache_creation: None,
 			service_tier: None,
+			speed: None,
 			iterations: Vec::new(),
 		}
 	}

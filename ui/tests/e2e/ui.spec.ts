@@ -577,6 +577,71 @@ test('creates a weighted virtual model with a concrete wildcard target', async (
 	});
 });
 
+test('dropdown menu fits its longest option', async ({ page }) => {
+	await mockGateway(page, populatedConfig());
+	await page.goto('/llm/client-setup');
+	// A compact dropdown whose trigger only fits a short selected label.
+	await page.addStyleTag({ content: '.client-recipe-select { width: 64px; }' });
+
+	await page.getByRole('combobox', { name: 'Integration' }).click();
+	const menu = page.locator('.custom-select-menu');
+	const box = await menu.boundingBox();
+	expect(box?.width).toBeGreaterThan(64);
+	expect(box?.width).toBeLessThanOrEqual(420);
+	const truncated = await menu
+		.locator('.custom-select-copy > span')
+		.evaluateAll(labels => labels.filter(label => label.scrollWidth > label.clientWidth).length);
+	expect(truncated).toBe(0);
+
+	// Searching down to one short option keeps the menu steady.
+	await page.getByRole('combobox', { name: 'Search Integration' }).fill('OpenAI JavaScript');
+	await expect(page.getByRole('option')).toHaveCount(1);
+	expect((await menu.boundingBox())?.width).toBe(box?.width);
+});
+
+test('dropdown menu stays on screen at the right edge', async ({ page }) => {
+	await mockGateway(page, populatedConfig());
+	await page.goto('/llm/client-setup');
+	await page.addStyleTag({
+		content: '.client-recipe-select { position: fixed; top: 80px; right: 8px; width: 64px; }'
+	});
+
+	await page.getByRole('combobox', { name: 'Integration' }).click();
+	const box = await page.locator('.custom-select-menu').boundingBox();
+	expect(box?.width).toBeGreaterThan(64);
+	expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(page.viewportSize()?.width ?? 0);
+	expect(box?.x).toBeGreaterThanOrEqual(0);
+});
+
+test('dropdown menu in a drawer', async ({ page }) => {
+	await mockGateway(page, populatedConfig());
+	await page.goto('/llm/models');
+	await page.getByRole('button', { name: 'Add model' }).first().click();
+	const provider = page.getByRole('combobox', { name: 'Provider', exact: true });
+	const menu = page.locator('.custom-select-menu');
+	const drawerBody = page.locator('.drawer-body');
+
+	// A full-width form dropdown keeps a menu matching its trigger.
+	await provider.click();
+	expect((await menu.boundingBox())?.width).toBe((await provider.boundingBox())?.width);
+	await provider.click();
+
+	// A compact one at the drawer's right edge stays inside without adding a horizontal scrollbar.
+	await page.addStyleTag({
+		content:
+			'.drawer-body .custom-select:has(.custom-select-trigger[aria-label="Provider"]) { width: 64px; margin-left: auto; }'
+	});
+	await provider.click();
+	const box = await menu.boundingBox();
+	const bodyBox = await drawerBody.boundingBox();
+	expect(box?.width).toBeGreaterThan(64);
+	expect((box?.x ?? 0) + (box?.width ?? 0)).toBeLessThanOrEqual(
+		(bodyBox?.x ?? 0) + (bodyBox?.width ?? 0)
+	);
+	const scrolls = await drawerBody.evaluate(body => body.scrollWidth > body.clientWidth);
+	expect(scrolls).toBe(false);
+});
+
 test('trims whitespace from a new model name and explicit model', async ({ page }) => {
 	const gateway = await mockGateway(page, populatedConfig());
 	await page.goto('/llm/models');
@@ -645,6 +710,76 @@ test('XDS mode shows an empty model inventory', async ({ page }) => {
 
 	await expect(page.getByText('No models are present in the active gateway dump.')).toBeVisible();
 	await expect(page.locator('.dump-models-table')).toHaveCount(0);
+});
+
+test('XDS mode counts targetRef policies on dump routes', async ({ page }) => {
+	const route = (name: string, ruleName: string | null, path: string) => ({
+		key: `demo-ns/${name}.${ruleName ?? 'default'}.demo-listener`,
+		name,
+		namespace: 'demo-ns',
+		ruleName,
+		kind: 'HTTPRoute',
+		matches: [{ path: { pathPrefix: path } }],
+		backends: []
+	});
+	const routes = [
+		route('demo-route', 'rule-a', '/a'),
+		route('demo-route', 'rule-b', '/b'),
+		route('other-route', null, '/other')
+	];
+	const dump = xdsDump([]);
+	dump.binds = [
+		{
+			key: '8080/demo-ns/demo-gw',
+			address: '[::]:8080',
+			protocol: 'http',
+			tunnelProtocol: 'direct',
+			mode: 'standard',
+			listeners: {
+				'demo-ns/demo-gw.demo-listener': {
+					key: 'demo-ns/demo-gw.demo-listener',
+					gatewayName: 'demo-gw',
+					gatewayNamespace: 'demo-ns',
+					listenerName: 'demo-listener',
+					hostname: '',
+					protocol: 'HTTP',
+					routes: Object.fromEntries(routes.map(r => [r.key, r]))
+				}
+			}
+		}
+	];
+	dump.policies = [
+		{
+			key: 'traffic/demo-ns/demo-route-authz',
+			target: { route: { name: 'demo-route', namespace: 'demo-ns', kind: 'HTTPRoute' } }
+		},
+		{
+			key: 'traffic/demo-ns/demo-rule-a-timeout',
+			target: {
+				route: { name: 'demo-route', namespace: 'demo-ns', ruleName: 'rule-a', kind: 'HTTPRoute' }
+			}
+		}
+	];
+	await mockXdsGateway(page, dump);
+	await page.goto('/traffic/routes');
+
+	const policyCount = (name: string) =>
+		page
+			.getByRole('row')
+			.filter({ has: page.getByText(name, { exact: true }) })
+			.getByRole('cell')
+			.nth(5);
+	await expect(policyCount('rule-a')).toHaveText('2');
+	await expect(policyCount('rule-b')).toHaveText('1');
+	await expect(policyCount('other-route')).toHaveText('0');
+
+	await page.getByRole('button', { name: 'View rule-a' }).click();
+	await expect(
+		page
+			.getByRole('dialog', { name: 'rule-a' })
+			.locator('.drawer-summary-list > div', { hasText: 'Policies' })
+			.locator('strong')
+	).toHaveText('2');
 });
 
 test('XDS mode offers Client Setup with models from the config dump', async ({ page }) => {
@@ -1169,6 +1304,81 @@ test('hybrid MCP settings only lock file-owned fields', async ({ page }) => {
 	expect(writes[0]).not.toHaveProperty('port');
 	expect(gateway.postedConfigs).toHaveLength(0);
 });
+
+for (const filePort of [false, true]) {
+	test(`hybrid LLM settings save to the database (filePort=${filePort})`, async ({ page }) => {
+		// The file may set the port; tls only comes from the llm.settings row.
+		const config = populatedConfig();
+		const fileLlm = config.llm as Record<string, unknown>;
+		if (!filePort) delete fileLlm.port;
+		const effective = structuredClone(config);
+		Object.assign(effective.llm as Record<string, unknown>, {
+			port: 4000,
+			tls: { cert: 'cert.pem', key: 'key.pem' }
+		});
+		const gateway = await mockGateway(page, config);
+		const writes: Array<Record<string, unknown>> = [];
+
+		await page.route('**/api/runtime', route =>
+			route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					build: {},
+					ui: { gatewayMode: 'standalone', configStoreMode: 'hybrid' }
+				})
+			})
+		);
+		await page.route('**/api/config/effective', route =>
+			route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify(effective)
+			})
+		);
+		await page.route('**/api/config/resources**', async route => {
+			if (route.request().method() === 'GET') {
+				await route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({ resources: [] })
+				});
+				return;
+			}
+			if (
+				route.request().method() === 'PUT' &&
+				new URL(route.request().url()).pathname.endsWith('/llm.settings')
+			) {
+				const request = route.request().postDataJSON() as {
+					resources: Array<{ value: Record<string, unknown> }>;
+				};
+				writes.push(request.resources[0].value);
+				await route.fulfill({
+					status: 200,
+					contentType: 'application/json',
+					body: JSON.stringify({ resources: [] })
+				});
+				return;
+			}
+			await route.fallback();
+		});
+
+		await page.goto('/');
+		await page.getByRole('button', { name: 'Settings' }).first().click();
+		const port = page.getByRole('textbox', { name: /Port/ });
+		if (filePort) {
+			await expect(port).toBeDisabled();
+			await expect(page.getByRole('button', { name: 'Save settings' })).toBeDisabled();
+			expect(writes).toHaveLength(0);
+		} else {
+			await port.fill('4100');
+			await page.getByRole('button', { name: 'Save settings' }).click();
+			await expect.poll(() => writes.length).toBe(1);
+			expect(writes[0]).toEqual({ port: 4100, tls: { cert: 'cert.pem', key: 'key.pem' } });
+		}
+		expect(gateway.postedConfigs).toHaveLength(0);
+	});
+}
 
 test('hybrid file-owned API key policy is read-only', async ({ page }) => {
 	const config = emptyConfig();

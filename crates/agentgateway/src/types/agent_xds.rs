@@ -1298,18 +1298,53 @@ fn convert_backend_ai_policy(
 
 fn backend_auth_credentials_from_proto(
 	credentials: Vec<proto::agent::BackendAuthCredential>,
+	diagnostics: &mut Diagnostics,
 ) -> Result<Vec<crate::http::auth::BackendAuthCredential>, ProtoError> {
+	use proto::agent::backend_auth_credential::Source;
 	credentials
 		.into_iter()
 		.map(|c| {
 			let location = optional_authorization_location(c.location.as_ref())?
 				.ok_or(ProtoError::MissingRequiredField)?;
-			Ok(crate::http::auth::BackendAuthCredential {
-				location,
-				key: secrecy::SecretString::from(c.value).into(),
-			})
+			let source = match c.source.unwrap_or(Source::Value(String::new())) {
+				Source::Value(value) => {
+					auth::BackendAuthCredentialSource::Key(secrecy::SecretString::from(value).into())
+				},
+				Source::Gcp(g) => {
+					auth::BackendAuthCredentialSource::Gcp(gcp_auth_from_proto(g, diagnostics))
+				},
+			};
+			Ok(crate::http::auth::BackendAuthCredential { location, source })
 		})
 		.collect()
+}
+
+fn gcp_auth_from_proto(g: proto::agent::Gcp, diagnostics: &mut Diagnostics) -> GcpAuth {
+	use proto::agent::gcp;
+	let credential =
+		g.credential.map(
+			|credential| match auth::gcp::GcpCredential::new(credential.into()) {
+				Ok(credential) => credential,
+				Err(error) => {
+					let reason = auth::gcp::sanitize_credential_error(&error);
+					diagnostics.add_warning(format!(
+						"GCP credential is invalid; requests using this policy will be rejected: {reason}"
+					));
+					auth::gcp::GcpCredential::new_invalid(reason)
+				},
+			},
+		);
+	match g.token_type {
+		None | Some(gcp::TokenType::AccessToken(gcp::AccessToken {})) => GcpAuth::AccessToken {
+			r#type: Some(auth::gcp::AccessToken),
+			credential,
+		},
+		Some(gcp::TokenType::IdToken(gcp::IdToken { audience })) => GcpAuth::IdToken {
+			r#type: auth::gcp::IdToken,
+			audience,
+			credential,
+		},
+	}
 }
 
 fn jwt_sign_from_proto(
@@ -1352,8 +1387,8 @@ fn backend_auth_kind_from_proto(
 	s: proto::agent::BackendAuthPolicy,
 	diagnostics: &mut Diagnostics,
 ) -> Result<Option<BackendAuthKind>, ProtoError> {
+	use proto::agent::azure_explicit_config;
 	use proto::agent::azure_managed_identity_credential::user_assigned_identity;
-	use proto::agent::{azure_explicit_config, gcp};
 	Ok(Some(match s.kind {
 		Some(proto::agent::backend_auth_policy::Kind::Passthrough(p)) => BackendAuthKind::Passthrough {
 			location: optional_authorization_location(p.authorization_location.as_ref())?,
@@ -1363,30 +1398,7 @@ fn backend_auth_kind_from_proto(
 			location: optional_authorization_location(k.authorization_location.as_ref())?,
 		},
 		Some(proto::agent::backend_auth_policy::Kind::Gcp(g)) => {
-			let credential =
-				g.credential.map(
-					|credential| match auth::gcp::GcpCredential::new(credential.into()) {
-						Ok(credential) => credential,
-						Err(error) => {
-							let reason = auth::gcp::sanitize_credential_error(&error);
-							diagnostics.add_warning(format!(
-								"GCP credential is invalid; requests using this policy will be rejected: {reason}"
-							));
-							auth::gcp::GcpCredential::new_invalid(reason)
-						},
-					},
-				);
-			BackendAuthKind::Gcp(match g.token_type {
-				None | Some(gcp::TokenType::AccessToken(gcp::AccessToken {})) => GcpAuth::AccessToken {
-					r#type: Some(auth::gcp::AccessToken),
-					credential,
-				},
-				Some(gcp::TokenType::IdToken(gcp::IdToken { audience })) => GcpAuth::IdToken {
-					r#type: auth::gcp::IdToken,
-					audience,
-					credential,
-				},
-			})
+			BackendAuthKind::Gcp(gcp_auth_from_proto(g, diagnostics))
 		},
 		Some(proto::agent::backend_auth_policy::Kind::Aws(a)) => {
 			let service_name = if a.service_name.is_empty() {
@@ -2018,6 +2030,7 @@ impl ModelRoute {
 								target: resolve_reference(failover.backend.as_ref()).into(),
 								inline_policies: vec![],
 							},
+							targets: vec![],
 						}
 					},
 					None => {
@@ -2674,7 +2687,7 @@ fn backend_policy_from_proto(
 			BackendTrafficPolicy::BackendTLS(tls)
 		},
 		Some(bps::Kind::Auth(auth)) => {
-			let credentials = backend_auth_credentials_from_proto(auth.credentials.clone())?;
+			let credentials = backend_auth_credentials_from_proto(auth.credentials.clone(), diagnostics)?;
 			let auth_kind = backend_auth_kind_from_proto(auth.clone(), diagnostics)?;
 			if auth_kind.is_none() && credentials.is_empty() {
 				return Err(ProtoError::MissingRequiredField);
@@ -3281,6 +3294,66 @@ fn traffic_policy_from_proto(
 				response: to_body(buffer.response),
 			}))
 		},
+		Some(tps::Kind::Compression(compression)) => {
+			use proto::agent::traffic_policy_spec::compression::Algorithm;
+
+			use crate::http::compression::CompressionAlgorithm;
+
+			let algorithms = |values: &[i32]| -> Result<Vec<_>, ProtoError> {
+				if values.is_empty() {
+					return Err(ProtoError::Generic(
+						"compression algorithms must not be empty".to_string(),
+					));
+				}
+				values
+					.iter()
+					.map(|v| {
+						Ok(match Algorithm::try_from(*v)? {
+							Algorithm::Gzip => CompressionAlgorithm::Gzip,
+							Algorithm::Brotli => CompressionAlgorithm::Brotli,
+							Algorithm::Deflate => CompressionAlgorithm::Deflate,
+							Algorithm::Zstd => CompressionAlgorithm::Zstd,
+						})
+					})
+					.collect()
+			};
+			TrafficPolicy::Compression(RequestPolicy::single(http::compression::Compression {
+				response: compression
+					.response
+					.as_ref()
+					.map(|r| -> Result<_, ProtoError> {
+						Ok(http::compression::CompressionResponse {
+							compress: r
+								.compress
+								.as_ref()
+								.map(|c| -> Result<_, ProtoError> {
+									Ok(http::compression::ResponseCompression {
+										algorithms: algorithms(&c.algorithms)?,
+									})
+								})
+								.transpose()?,
+						})
+					})
+					.transpose()?,
+				request: compression
+					.request
+					.as_ref()
+					.map(|r| -> Result<_, ProtoError> {
+						Ok(http::compression::CompressionRequest {
+							decompress: r
+								.decompress
+								.as_ref()
+								.map(|d| -> Result<_, ProtoError> {
+									Ok(http::compression::RequestDecompression {
+										algorithms: algorithms(&d.algorithms)?,
+									})
+								})
+								.transpose()?,
+						})
+					})
+					.transpose()?,
+			}))
+		},
 		None => return Err(ProtoError::MissingRequiredField),
 	})
 }
@@ -3601,20 +3674,34 @@ fn frontend_policy_from_proto(
 				.map_err(|e| ProtoError::Generic(e.to_string()))?;
 			FrontendPolicy::HTTP(http)
 		},
-		Some(fps::Kind::Tls(t)) => FrontendPolicy::TLS(frontend::TLS {
-			handshake_timeout: t
-				.handshake_timeout
-				.map(convert_duration)
-				.unwrap_or_else(crate::defaults::tls_handshake_timeout),
-			alpn: t
-				.alpn
-				.as_ref()
-				.map(|t| t.protocols.iter().map(|s| s.as_bytes().to_vec()).collect()),
-			min_version: map_tls_version(t.min_version),
-			max_version: map_tls_version(t.max_version),
-			cipher_suites: convert_tls_cipher_suites(&t.cipher_suites, diagnostics),
-			key_exchange_groups: convert_tls_key_exchange_groups(&t.key_exchange_groups, diagnostics),
-		}),
+		Some(fps::Kind::Tls(t)) => {
+			let cipher_suites = convert_tls_cipher_suites(&t.cipher_suites, diagnostics);
+			let key_exchange_groups =
+				convert_tls_key_exchange_groups(&t.key_exchange_groups, diagnostics);
+			// The TLS config is built lazily on the first handshake, so report an unusable selection here.
+			if let Err(e) = crate::transport::tls::provider_with_options_validated(
+				cipher_suites.as_deref().unwrap_or_default(),
+				key_exchange_groups.as_deref().unwrap_or_default(),
+			) {
+				diagnostics.add_warning(format!(
+					"invalid frontend TLS policy, TLS handshakes will fail: {e}"
+				));
+			}
+			FrontendPolicy::TLS(frontend::TLS {
+				handshake_timeout: t
+					.handshake_timeout
+					.map(convert_duration)
+					.unwrap_or_else(crate::defaults::tls_handshake_timeout),
+				alpn: t
+					.alpn
+					.as_ref()
+					.map(|t| t.protocols.iter().map(|s| s.as_bytes().to_vec()).collect()),
+				min_version: map_tls_version(t.min_version),
+				max_version: map_tls_version(t.max_version),
+				cipher_suites,
+				key_exchange_groups,
+			})
+		},
 		Some(fps::Kind::Tcp(t)) => FrontendPolicy::TCP(frontend::TCP {
 			keepalives: t
 				.keepalives
@@ -4148,6 +4235,7 @@ fn conditional_traffic_policy_to_policy(
 		TrafficPolicy::DirectResponse(_) => build!(DirectResponse),
 		TrafficPolicy::CORS(_) => build!(CORS),
 		TrafficPolicy::Buffer(_) => build!(Buffer),
+		TrafficPolicy::Compression(_) => build!(Compression),
 		other => Err(ProtoError::Generic(format!(
 			"conditional traffic policy kind {} is not supported",
 			traffic_policy_kind_name(other)
@@ -4183,6 +4271,7 @@ fn traffic_policy_kind_name(policy: &TrafficPolicy) -> &'static str {
 		TrafficPolicy::RequestMirror(_) => "requestMirror",
 		TrafficPolicy::DirectResponse(_) => "directResponse",
 		TrafficPolicy::Buffer(_) => "buffer",
+		TrafficPolicy::Compression(_) => "compression",
 		TrafficPolicy::CORS(_) => "cors",
 	}
 }
@@ -6175,7 +6264,7 @@ mod tests {
 		let ModelRouteKind::Virtual(model) = route.kind else {
 			panic!("expected virtual model route");
 		};
-		let llm::model_router::VirtualModelRouting::Failover { backend } = model.routing else {
+		let llm::model_router::VirtualModelRouting::Failover { backend, .. } = model.routing else {
 			panic!("expected failover routing");
 		};
 		assert_eq!(backend.weight, 1);
@@ -6918,5 +7007,133 @@ mod tests {
 			"error should name the group, got: {err}"
 		);
 		assert_eq!(diagnostics.into_warnings().len(), 1);
+	}
+
+	#[cfg(feature = "fips")]
+	#[rstest::rstest]
+	#[case::cipher_suite(
+		vec![proto::agent::tls_config::CipherSuite::TlsChacha20Poly1305Sha256 as i32],
+		vec![],
+		"TLS_CHACHA20_POLY1305_SHA256"
+	)]
+	#[case::key_exchange_group(
+		vec![],
+		vec![proto::agent::tls_config::KeyExchangeGroup::X25519 as i32],
+		"X25519"
+	)]
+	fn fips_frontend_policy_from_proto_non_approved_tls_warns(
+		#[case] cipher_suites: Vec<i32>,
+		#[case] key_exchange_groups: Vec<i32>,
+		#[case] expected: &str,
+	) {
+		use crate::types::proto::agent::frontend_policy_spec as fps;
+
+		let spec = proto::agent::FrontendPolicySpec {
+			kind: Some(fps::Kind::Tls(fps::Tls {
+				cipher_suites,
+				key_exchange_groups,
+				..Default::default()
+			})),
+		};
+		let mut diagnostics = Diagnostics::default();
+		let policy = frontend_policy_from_proto(&spec, &mut diagnostics)
+			.expect("a non-approved frontend TLS policy should still be stored");
+
+		assert!(matches!(policy, FrontendPolicy::TLS(_)));
+		let warnings = diagnostics.into_warnings();
+		assert_eq!(warnings.len(), 1, "{warnings:?}");
+		assert!(
+			warnings[0].contains(expected),
+			"warning should name {expected}, got: {}",
+			warnings[0]
+		);
+	}
+
+	#[test]
+	fn frontend_policy_from_proto_approved_tls_does_not_warn() {
+		use crate::types::proto::agent::frontend_policy_spec as fps;
+
+		let spec = proto::agent::FrontendPolicySpec {
+			kind: Some(fps::Kind::Tls(fps::Tls {
+				cipher_suites: vec![proto::agent::tls_config::CipherSuite::TlsAes128GcmSha256 as i32],
+				key_exchange_groups: vec![proto::agent::tls_config::KeyExchangeGroup::P256 as i32],
+				..Default::default()
+			})),
+		};
+		let mut diagnostics = Diagnostics::default();
+		frontend_policy_from_proto(&spec, &mut diagnostics).expect("valid frontend TLS policy");
+		assert!(diagnostics.into_warnings().is_empty());
+	}
+
+	#[test]
+	fn compression_from_proto() {
+		use proto::agent::traffic_policy_spec::Compression as ProtoCompression;
+		use proto::agent::traffic_policy_spec::compression::{
+			Algorithm, Request, RequestDecompression, Response, ResponseCompression,
+		};
+
+		use crate::http::compression::CompressionAlgorithm;
+
+		let spec = |response: Vec<i32>, request: Vec<i32>| proto::agent::TrafficPolicySpec {
+			phase: proto::agent::traffic_policy_spec::PolicyPhase::Route as i32,
+			kind: Some(proto::agent::traffic_policy_spec::Kind::Compression(
+				ProtoCompression {
+					response: Some(Response {
+						compress: Some(ResponseCompression {
+							algorithms: response,
+						}),
+					}),
+					request: Some(Request {
+						decompress: Some(RequestDecompression {
+							algorithms: request,
+						}),
+					}),
+				},
+			)),
+		};
+
+		let policy = traffic_policy_from_proto(
+			&spec(
+				vec![Algorithm::Zstd as i32, Algorithm::Brotli as i32],
+				vec![Algorithm::Gzip as i32],
+			),
+			&mut Diagnostics::default(),
+		)
+		.unwrap();
+		let TrafficPolicy::Compression(policy) = policy else {
+			panic!("expected compression policy");
+		};
+		let compression = &policy.iter().next().unwrap().pol;
+		assert_eq!(
+			compression
+				.response
+				.as_ref()
+				.and_then(|r| r.compress.as_ref())
+				.unwrap()
+				.algorithms,
+			vec![CompressionAlgorithm::Zstd, CompressionAlgorithm::Brotli]
+		);
+		assert_eq!(
+			compression
+				.request
+				.as_ref()
+				.and_then(|r| r.decompress.as_ref())
+				.unwrap()
+				.algorithms,
+			vec![CompressionAlgorithm::Gzip]
+		);
+
+		let gzip = || vec![Algorithm::Gzip as i32];
+		for (response, request) in [
+			(vec![99], gzip()),
+			(gzip(), vec![Algorithm::Gzip as i32, 99]),
+			(vec![], gzip()),
+			(gzip(), vec![]),
+		] {
+			assert!(
+				traffic_policy_from_proto(&spec(response, request), &mut Diagnostics::default()).is_err(),
+				"unknown or empty algorithms must be rejected"
+			);
+		}
 	}
 }
